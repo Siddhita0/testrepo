@@ -1,0 +1,1020 @@
+---
+title: "Hematopoiesis_healthy_eLife"
+author: "Siddhita"
+date: "2024-09-20"
+output: html_document
+---
+
+```{r}
+# Load necessary libraries
+
+#rm(list = ls())
+library(future)
+library(future.apply)
+library(Seurat)
+library(patchwork)
+library(tidyverse)
+library(scCustomize)
+library(Matrix)
+library(ggplot2)
+library(purrr)
+library(DoubletFinder)
+library(harmony)
+library(presto)
+library(furrr)
+library(RColorBrewer)
+library(cowplot)
+
+# install.packages("devtools")
+#devtools::install_github("immunogenomics/presto")
+#install.packages("remotes")
+#remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")
+#install.packages("BiocManager") # Needed to install all Bioconductor packages
+#BiocManager::install("MAST")
+#install.packages("readxl")  
+#library(readxl)
+
+```
+
+##Read filtered seurat objects(RDS)
+
+```{r Load RDS}
+# Define the list of file paths
+
+#rm(list = ls())
+file_paths <- list(
+  "../thesis-r-scripts/rds/seu_Young-1.rds",
+  "../thesis-r-scripts/rds/seu_Young-2.rds",
+  "../thesis-r-scripts/rds/seu_Young-3.rds",
+  "../thesis-r-scripts/rds/seu_Young-4.rds",
+  "../thesis-r-scripts/rds/seu_Young-5.rds"
+)
+
+project_names <- c("Young-1", "Young-2", "Young-3", "Young-4", "Young-5")
+
+# Load all Seurat objects into a list using lapply
+seurat_objects <- lapply(file_paths, readRDS)
+
+# Access individual Seurat objects from the list and Store each Seurat object in a separate variable
+
+for (i in seq_along(seurat_objects)) {
+  project_name <- project_names[i]  
+  assign(paste0("seurat.Obj_", project_name), seurat_objects[[i]])
+  }
+
+```
+
+##Preprocess individual samples (Done)
+
+```{r Preprocess on individual samples}
+
+# Set up parallel processing plan (multisession mode)
+plan(multisession, workers = 2)  # Adjust workers based on system capacity
+options(future.globals.maxSize = 8 * 1024^3)  # Set the global size limit to 8 GiB
+
+# Define function to load Seurat object from file
+load_seurat <- function(file_path, project_name, min_cells = 3, min_features = 100) {
+  data <- Read10X_h5(file_path)
+  seurat_obj <- CreateSeuratObject(counts = data, project = project_name, min.cells = min_cells, min.features = min_features)
+  return(seurat_obj)
+}
+
+# Define function for QC 
+process_seurat <- function(seurat_obj, project_name, nfeatures, nCounts, mt_threshold) {
+  
+  # 1.Calculate percentage of mitochondrial reads
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+  
+   #Plot QC metrics 
+  plot_qc_vln(seurat_obj, project_name, mt_threshold)
+  plot_qc_scatter(seurat_obj, project_name, mt_threshold)
+   
+   # 2.Subset cells based on QC metrics
+  seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > nfeatures & nCount_RNA < nCounts & percent.mt < mt_threshold)
+  
+  return(seurat_obj)
+
+}
+
+# Define function to plot QC metrics 
+plot_qc_vln <- function(seurat_obj, project_name, mt_threshold) {
+  # Plot QC metrics
+  vln_plot <- VlnPlot(seurat_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+  ggsave(filename = paste0("../eLife_/Plots/Voiln plot/vln_plot_", project_name, ".png"), plot = vln_plot, width = 10, height = 5)
+  print(vln_plot)
+}
+
+# Scatter plots for feature relationships
+plot_qc_scatter <- function(seurat_obj, project_name, mt_threshold) {
+  
+  scatter_plot1 <- FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + geom_smooth(method = 'lm')
+  
+ # ggsave(filename = paste0("scatter_plot1_", project_name, ".png"), plot = scatter_plot1, width = 5, height = 5)
+  #print(scatter_plot1)
+  
+  scatter_plot2 <- FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
+  #ggsave(filename = paste0("scatter_plot2_", project_name, ".png"), plot = scatter_plot2, width = 5, height = 5)
+  
+  #print(scatter_plot2)
+  scatter_plots <- scatter_plot1 + scatter_plot2
+  
+  ggsave(filename = paste0("../eLife_/Plots/scatterplot/scatter_plots_", project_name, ".png"), plot = scatter_plots, width = 10, height = 5)
+  
+} 
+
+
+# Define the main workflow to process each sample
+process_sample <- function(file_path, project_name, nfeatures, nCounts, mt_threshold) {
+ 
+   # Load Seurat object
+  seurat_obj <- load_seurat(file_path, project_name)
+  
+  # Process Seurat object 
+  seurat_obj <- process_seurat(seurat_obj, project_name, nfeatures, nCounts, mt_threshold)
+  
+  # Modify meta.data and colnames
+  # Remove any duplicate sample names from the barcodes
+  seurat_obj@meta.data$sample_name <- seurat_obj@meta.data$orig.ident
+  seurat_obj@meta.data$sample_name <- gsub("_.*", "", seurat_obj@meta.data$sample_name)  # Keep only the first instance
+  
+  # Correct barcodes: remove the initial sample name and concatenate only once
+  colnames(seurat_obj) <- gsub(paste0("_", seurat_obj@meta.data$sample_name), "", colnames(seurat_obj))# Remove extra "_sample_name"
+  colnames(seurat_obj) <- paste0(colnames(seurat_obj), "_", seurat_obj@meta.data$sample_name)
+  
+  # Save Seurat object to RDS
+  saveRDS(seurat_obj, file = paste0("../rds/seu_", project_name, ".rds"))
+
+  return(seurat_obj)
+}
+
+# Define file paths, project names, and QC thresholds
+file_paths <- list(
+  "../eLife_/GSE180298_RAW/GSM5460406_young1_filtered_feature_bc_matrix.h5",
+  "../eLife_/GSE180298_RAW/GSM5460407_young2_filtered_feature_bc_matrix.h5",
+  "../eLife_/GSE180298_RAW/GSM5460408_young3_filtered_feature_bc_matrix.h5",
+  "../eLife_/GSE180298_RAW/GSM5460409_young4_filtered_feature_bc_matrix.h5",
+  "../eLife_/GSE180298_RAW/GSM5460410_young5_filtered_feature_bc_matrix.h5"
+)
+
+project_names <- c("Young-1", "Young-2", "Young-3", "Young-4", "Young-5")
+nfeatures <- c(500, 500, 500, 500, 500)
+nCounts <- c(30000, 15000, 40000, 30000, 40000)
+mt_thresholds <- c(5, 5, 5, 5, 10)
+
+  
+# Process samples using future_lapply to parallelize the task
+seurat_objects <- future_lapply(1:length(file_paths), function(i) {
+  
+  tryCatch({
+    process_sample(file_paths[[i]], project_names[i], nfeatures[i], nCounts[i], mt_thresholds[i])
+  }, error = function(e) {
+       return(paste("Error:", e$message))
+  })
+}, future.seed = TRUE)
+
+```
+
+##Doublets removal
+
+```{r}
+
+# loop through samples to find doublets
+for (i in 1:length(seurat_objects)) {
+  # print the sample we are on
+  print(paste0("Sample ",i))
+  
+ merged_seurat_harmony_sub <- seurat_objects[[i]]
+  
+ merged_seurat_harmony_sub <- Seurat::NormalizeData(merged_seurat_harmony_sub, verbose = FALSE) %>% 
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%   
+  ScaleData() %>% 
+  RunPCA(pc.genes = merged_seurat_harmony_sub@var.genes, npcs = 20, verbose = FALSE)
+ 
+
+  # Doublet detection and removal
+  sweep.list <- paramSweep(merged_seurat_harmony_sub, PCs = 1:15)
+  sweep.stats <- summarizeSweep(sweep.list)
+  bcmvn <- find.pK(sweep.stats)
+  nExp <- round(0.03*nrow(merged_seurat_harmony_sub@meta.data)) # assumption that 3% of the captured cells are doublets
+
+
+ ##Plot bcmvn for determining pk : 
+ pK=as.numeric(as.character(bcmvn$pK)) #Converts the pK values from the bcmvn object (which stores the results of doublet detection parameter optimization) to a numeric vector
+ BCmetric=bcmvn$BCmetric
+ pK_choose = pK[which(BCmetric %in% max(BCmetric))]
+
+ par(mar=c(5,4,4,8)+1,cex.main=1.2,font.main=2)
+ plot(x = pK, y = BCmetric, pch = 16,type="b",
+ col = "blue",lty=1)
+ abline(v=pK_choose,lwd=2,col='red',lty=2)
+ title("The BCmvn distributions")
+ text(pK_choose,max(BCmetric),as.character(pK_choose),pos = 4,col = "red")
+
+  # Save the plot
+  plot_file_path <- paste0("BCmvn_plot_sample_", i, ".png")
+  png(plot_file_path)
+  plot(x = pK, y = BCmetric, pch = 16, type = "b",
+       col = "blue", lty = 1)
+  abline(v = pK_choose, lwd = 2, col = 'red', lty = 2)
+  title("The BCmvn Distributions")
+  text(pK_choose, max(BCmetric), as.character(pK_choose), pos = 4, col = "red")
+  dev.off()
+  
+ #pk has to be determined indiviudally for each dataset : 
+ merged_seurat_harmony_sub <- doubletFinder(merged_seurat_harmony_sub, PCs = 1:15, pN = 0.25, pK = pK_choose, nExp = nExp, reuse.pANN = FALSE, sct = FALSE)
+ 
+ metadata <- merged_seurat_harmony_sub@meta.data
+ colnames(metadata)[7] <- "doublet_finder"
+ merged_seurat_harmony_sub@meta.data <- metadata 
+  
+  # subset and save
+  singlets <- subset(merged_seurat_harmony_sub, doublet_finder == "Singlet")
+  seurat_objects[[i]] <- singlets
+  remove(singlets)
+}
+
+```
+
+##All singlets merged into one object:
+
+```{r}
+merged_seurat_harmony_singlets <- merge(x = seurat_objects[[1]],
+                       y = c(seurat_objects[[2]], seurat_objects[[3]], seurat_objects[[4]],
+                             seurat_objects[[5]]),
+                       project = "HSC",
+                       merge.data = TRUE)
+dim(merged_seurat_harmony_singlets)
+```
+
+##Singlets barcodes :
+
+```{r}
+length(names(Idents(merged_seurat_harmony_singlets)))
+singlets <- names(Idents(merged_seurat_harmony_singlets))
+```
+
+##Merge the samples
+
+```{r}
+merged_seurat <- purrr::reduce(seurat_objects, function(x,y) {merge(x,y)})
+#Once the merge is done the counts are not merged hence this needs to be done
+#to merge the counts from different samples into one counts layer 
+merged_seurat <- JoinLayers(merged_seurat)
+metadata <- merged_seurat@meta.data
+
+```
+
+##Add barcode column to metadata : Now the merged seurat object will have only singlets :
+
+```{r}
+
+metadata$barcode <- rownames(metadata)
+merged_seurat@meta.data <- metadata
+
+##Subset the merged_seurat object to have only singlets : 
+merged_seurat <- subset(merged_seurat, subset = barcode %in% singlets)
+
+##Metadata : 
+metadata <- merged_seurat@meta.data
+```
+
+
+
+```{r}
+saveRDS(merged_seurat, file = paste0("../thesis-r-scripts/rds/merged_seurat/", "merged_seurat_doublets_removed.Rds"))
+
+```
+
+## Read merged_seurat_doublets_removed.Rds
+
+```{r}
+
+merged_seurat <- readRDS(file = paste0("../thesis-r-scripts/rds/merged_seurat/merged_seurat_doublets_removed.Rds"))
+
+```
+
+#Setting the cell cyle genes
+
+```{r}
+# Load the pre-compiled gene lists for S and G2/M phases
+cc_genes <- Seurat::cc.genes #S and G2M phase gene lists
+s_genes <- cc_genes$s.genes  # Genes related to the S phase
+g2m_genes <- cc_genes$g2m.genes  # Genes related to G2/M phase
+
+```
+
+# Normalisation, highly variable genes, scaling, PCA
+
+```{r }
+
+# Normalize the data and find highly variable features using the pipe function
+
+merged_seurat_harmony <- NormalizeData(merged_seurat, verbose = FALSE) 
+
+merged_seurat_harmony <- 
+    # Perform cell cycle scoring
+    CellCycleScoring(merged_seurat_harmony, g2m.features = g2m_genes,s.features = s_genes,set.ident = FALSE) %>%
+    
+    # Scale the data and regress out cell cycle scores
+    ScaleData(vars.to.regress = c("S.Score", "G2M.Score"))
+
+
+
+# After scoring, the metadata will have additional columns: S.Score, G2M.Score, and Phase
+#head(merged_seurat_harmony@meta.data)
+
+
+##Add the cell cycle difference (scores cells based on their cell cycle phase (G2/M and S phases)The function calculates a score for each cell based on its expression of G2/M and S phase genes. Cell cycle scoring helps to identify and account for cell cycle effects, as some cells may naturally have higher expression of genes related to the S phase or G2/M phase. These phases may influence the clustering and other analyses) : 
+
+
+#A positive CC.Difference indicates that a cell is more aligned with the S phase, while a negative score indicates a bias toward the G2/M phase.
+#merged_seurat_harmony$CC.Difference <- merged_seurat_harmony$S.Score - merged_seurat_harmony$G2M.Score 
+  
+##Regress out for the cell cycle difference : 
+merged_seurat_harmony <- merged_seurat_harmony %>% FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>% RunPCA(npcs = 50)
+
+```
+
+
+
+##Integrate using Harmony :
+
+```{r}
+
+merged_seurat_harmony <- merged_seurat_harmony %>%
+  RunHarmony("sample_name")
+
+```
+
+# Save merged_seurat_harmony
+
+```{r}
+
+saveRDS(merged_seurat_harmony, file = paste0("../thesis-r-scripts/rds/merged_seurat/", "merged_seurat_harmony1.Rds"))
+```
+
+
+##UMAP, FIND NEIGHBORS AND CLUSTERING=====================================
+
+```{r}
+##Run UMAP and find neighbors :
+
+merged_seurat_harmony <- RunUMAP(merged_seurat_harmony, reduction='harmony', 
+                                 dims = 1:35, seed.use = 123)
+merged_seurat_harmony <- FindNeighbors(merged_seurat_harmony, reduction='harmony', 
+                                       dims = 1:35) 
+merged_seurat_harmony <- FindClusters(merged_seurat_harmony, resolution = 0.5, algorithm = 1)
+```
+
+# Save merged_seurat_harmony(after having clusters)
+
+```{r}
+
+saveRDS(merged_seurat_harmony, file = paste0("../thesis-r-scripts/rds/merged_seurat/", "merged_seurat_harmony(clustered).Rds"))
+```
+
+## Read merged_seurat_harmony.rds (after having clusters)
+
+```{r}
+
+merged_seurat_harmony <- readRDS(file = paste0("../thesis-r-scripts/rds/merged_seurat/merged_seurat_harmony(clustered).Rds"))
+
+
+```
+
+
+# Cluster silhouette
+
+
+```{r}
+
+library(cluster)
+library(RColorBrewer)
+#how similar cells within the same cluster are compared to cells in other clusters, helping to assess cluster quality
+  d<-dist(x = merged_seurat_harmony@reductions$pca@cell.embeddings[,1:50])
+	s<-silhouette(x = as.numeric(merged_seurat_harmony$seurat_clusters), dist = d)
+	summary(s)
+	s.avg<-as.numeric(summary(s)$clus.avg.widths)
+	c<-length(unique(merged_seurat_harmony$seurat_clusters)) - 1
+	col <- brewer.pal(length(unique(merged_seurat_harmony$seurat_clusters)), "Set3")  # Use the "Set3" color palette
+  barplot(s.avg, horiz = T, names.arg = as.character(0:c), col = col)
+	print("Silhouette per cluster")
+	names(s.avg)<-as.character(0:c)
+	print(s.avg)
+	print(paste0("Average silhouette: ", mean(s.avg)))
+
+	
+```
+
+
+
+```{r}
+
+merged_umap <- DimPlot(merged_seurat_harmony, pt.size = 0.1, label = T) 
+ggsave(filename = "../thesis-r-scripts/Plots/UMAP/merged_UMAP_0.5_pc35New.png", plot = merged_umap, width = 5, height = 5)
+
+merged_umap
+```
+
+
+
+```{r}
+Idents(merged_seurat_harmony) <- merged_seurat_harmony@meta.data$sample_name
+young_umap <- DimPlot(merged_seurat_harmony,label = F)
+ggsave(filename = "../thesis-r-scripts/Plots/UMAP/young_UMAPNew.png", plot = young_umap, width = 5, height = 5)
+
+young_umap
+```
+
+##Resolution == 0.5
+
+```{r}
+##Increase the resolution to 0.4 : 
+#merged_seurat_harmony_res_0.6 <- FindClusters(merged_seurat_harmony, resolution = 0.6)
+#table(Idents(merged_seurat_harmony_res_0.6))
+
+# Markers used by eLife:-
+
+g_umap <- DimPlot(merged_seurat_harmony, label = F) + ggtitle("Res:0.5, npcs : 50")
+
+features <-  c("TPSAB1", "MS4A3", "MS4A2", "HDC", "RUNX1", "KLF1", "AHSP", "CA1", "HBB", "HBD", "GATA1",  
+                       "GP1BA", "FLII", "VWF", "PBX1", "TAL1", "NFE2", "HOXA10", "HOXA9", "CXXC5", "LTB", 
+                       "PRSS2", "JCHAIN", "IGHM", "CD79B", "CD79A", "EBF1", "VPREB1", "DNTT", "IL7R", "SPIB", 
+                       "IGKC", "IL3RA", "IRF7", "IRF8", "CSTA", "LYZ", "CST7", "CEBPA", "AZU1", "ELANE", 
+                       "MPO", "PRTN3", "CTSG", "CSF3R", "SATB1", "PROM1", "FLT3", "PTPRC", "CD34", "HOPX", "CRHBP")
+
+
+
+g_heatmap <- DotPlot(merged_seurat_harmony, features = features, group.by = "seurat_clusters", dot.scale = 4) + theme(axis.text.y = element_text(angle = 45, vjust = 1, hjust=1, size = 8), # Adjust angle and text size
+        axis.text.x = element_text(size = 10), # Smaller text for y-axis labels
+        axis.title.y = element_text(size = 10, face = "bold"), # Bold x-axis title
+        axis.title.x = element_text(size = 10, face = "bold"), # Bold y-axis title
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"), # Center and bold title
+        legend.position = "bottom") + 
+  #scale_color_viridis_c(option = "plasma") + # Use a colorblind-friendly palette like viridis
+ ggtitle("DotPlot of Cluster Markers")+coord_flip()+theme_classic()
+
+
+ggsave(filename = "../thesis-r-scripts/Plots/Heatmap/heatmapCluster.png", plot = g_heatmap, width = 15, height = 10)
+g_heatmap
+
+g_res_0.5 <- g_umap + g_heatmap
+ggsave(filename = "../thesis-r-scripts/Plots/Heatmap/heatmap+umap_Cluster.png", plot = g_res_0.5, width = 20, height = 10)
+
+g_heatmap
+```
+
+
+```{r}
+
+```
+
+
+# Check clusters manually (heatmap)
+
+```{r}
+
+g_umap <- DimPlot(merged_seurat_harmony, label = F) + ggtitle("Res:0.5, npcs : 50")
+
+features <- c("GMP", "Erythroid early", "HSC", "GMP granulocytes", "Monocytes", "MEP",
+    "pDC", "CLP", "Pro-B", "LMPP", "Basophils", "Not assigned", "T/NK", "Megakaryocytes")
+
+                       
+
+g_heatmap <- DotPlot(merged_seurat_harmony, features = features, group.by = "seurat_clusters", dot.scale = 8) + theme(axis.text.y = element_text(angle = 45, vjust = 1, hjust=1, size = 8), # Adjust angle and text size
+        axis.text.x = element_text(size = 10), # Smaller text for y-axis labels
+        axis.title.y = element_text(size = 10, face = "bold"), # Bold x-axis title
+        axis.title.x = element_text(size = 10, face = "bold"), # Bold y-axis title
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"), # Center and bold title
+        legend.position = "bottom") + 
+ # scale_color_viridis_c(option = "plasma") + # Use a colorblind-friendly palette like viridis
+ ggtitle("DotPlot of Cluster Markers")+coord_flip()+theme_classic()
+
+g_heatmap
+
+
+
+```
+
+# Plots
+
+```{r}
+
+
+plot2<-VlnPlot(merged_seurat_harmony,features=c("HBD","APOC1","HBB","AHSP","CA1","BLVRB","MYC","CA1","S100A6","FAM178B","SLC25A371","HBB1"),pt.size=0)
+
+plot1+plot2+plot_layout(widths=c(1,2))
+
+FeaturePlot(merged_seurat_harmony, features = c("HBD","APOC1","HBB","AHSP","CA1","BLVRB","MYC","CA1","S100A6","FAM178B"))
+FeaturePlot(merged_seurat_harmony, features = c("KLF1", "AHSP","CA1"))
+
+plot2
+
+```
+
+##Make a stacked barplot of celltype of interest vs predicted :
+
+```{r}
+table(Idents(merged_seurat_harmony))
+table(merged_seurat_harmony@meta.data$seurat_clusters)
+
+df_celltype <- merged_seurat_harmony@meta.data[,c("sample_name","seurat_clusters")] 
+```
+
+#sample cluster distribution
+
+```{r}
+
+plot <- df_celltype %>% 
+  group_by(sample_name,seurat_clusters) %>% 
+  summarise(n=n()) %>% 
+  ggplot()+
+  aes(x=sample_name,
+      y=n, fill = seurat_clusters)+
+  geom_bar(stat = "identity",
+           position = "fill") + 
+  geom_text(
+    aes(label = seurat_clusters),
+    position = position_fill(vjust = 0.5),
+    size = 3,   # You can adjust the size of the text
+    color = "white"  # Change color if needed to ensure readability
+  ) +
+  coord_flip() +
+  theme_classic()
+
+ggsave(filename = "../thesis-r-scripts/Plots/Heatmap/sample_cluster_distribution.png", plot = plot, width = 8, height = 6, dpi = 300)
+
+plot
+```
+
+# Default assay
+
+```{r}
+DefaultAssay(merged_seurat_harmony)
+```
+
+```{r}
+
+
+library(presto)
+####============================================FindMarkers======================================================================
+
+##FindMarkers : Find the differentially expressed genes in each of the different clusters to 
+#annotate them :
+
+# Find markers to enable cluster annotation (supplementary file)
+markers <- FindAllMarkers(merged_seurat_harmony, only.pos = TRUE, min.pct = 0.25,
+                          logfc.threshold = 0.25,test.use = "MAST") # slot = data
+
+```
+
+#save and read markers.rds
+
+```{r}
+saveRDS(markers, file = paste0("../thesis-r-scripts/rds/Markers/", "markers.rds"))
+```
+
+
+```{r}
+markers <- readRDS(file = paste0("../thesis-r-scripts/rds/Markers/markers.rds"))
+```
+
+#Check markers for each cluster
+```{r }
+
+#saveRDS(markers, file = paste(rdaDir,"/find_markers_cellcyclereg.rds",sep = ""))
+##Save the top 50 100 and 200 markers within each cluster : 
+
+
+markers %>% filter(cluster == 0) -> C0
+markers %>% filter(cluster == 1) -> C1
+markers %>% filter(cluster == 2) -> C2
+markers %>% filter(cluster == 3) -> C3
+markers %>% filter(cluster == 4) -> C4
+markers %>% filter(cluster == 5) -> C5
+markers %>% filter(cluster == 6) -> C6
+markers %>% filter(cluster == 7) -> C7
+markers %>% filter(cluster == 8) -> C8
+markers %>% filter(cluster == 9) -> C9
+markers %>% filter(cluster == 10) -> C10
+markers %>% filter(cluster == 11) -> C11
+markers %>% filter(cluster == 12) -> C12
+markers %>% filter(cluster == 13) -> C13
+
+
+
+
+```
+
+# 
+
+```{r}
+library(readxl)
+
+df <- read_excel("../thesis-r-scripts/Cell-type specific markers for each of the studied conditions (adjusted p-value 0.01 and logFC 0.1)..xlsx", sheet = "Young")  
+
+
+hsc_cells <- df %>% filter(CellType == "HSC")
+lmpp_cells <- df %>% filter(CellType == "LMPP")
+gmp_cells <- df %>% filter(CellType == "GMP")
+GMP_Granulocytes_cells <- df %>% filter(CellType == "GMP_Granulocytes")
+Monocytes_cells <- df %>% filter(CellType == "Monocytes")
+pDC_cells <- df %>% filter(CellType == "pDC")
+CLP_cells <- df %>% filter(CellType == "CLP")
+ProB_cells <- df %>% filter(CellType == "ProB")
+T_NK_cells <- df %>% filter(CellType == "T_NK")
+MEP_cells <- df %>% filter(CellType == "MEP")
+Megakaryocytes_cells <- df %>% filter(CellType == "Megakaryocytes")
+Erythroid_early_cells <- df %>% filter(CellType == "Erythroid_early")
+Erythroid_late_cells <- df %>% filter(CellType == "Erythroid_late")
+Basophils_cells <- df %>% filter(CellType == "Basophils")
+
+
+
+
+
+
+# Find common genes
+common_genes_c2 <- inner_join(hsc_cells, top500_C2, by = c("Gene" = "gene"))
+common_genes_c3 <- inner_join(gmp_cells, top500_C3, by = c("Gene" = "gene"))
+
+
+common_genes_c10 <- inner_join(Basophils_cells, top600_C10, by = c("Gene" = "gene"))
+common_genes_c1 <- inner_join(Erythroid_late_cells, top2000_C1, by = c("Gene" = "gene"))
+
+print(common_genes)
+```
+
+# assign celltypes identity to clusters
+
+```{r}
+new.cluster.ids <- c("GMP", "Erythroid early", "HSC", "GMP granulocytes", "Monocytes", "MEP",
+    "pDC", "CLP", "Pro-B", "LMPP", "Basophils", "Not assigned", "T/NK", "Megakaryocytes")
+names(new.cluster.ids) <- levels(merged_seurat_harmony)
+merged_seurat_harmony <- RenameIdents(merged_seurat_harmony, new.cluster.ids)
+plot <- DimPlot(merged_seurat_harmony, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+
+ggsave(filename = "../thesis-r-scripts/Plots/UMAP/cellType_Annotation.png", plot = plot, width = 8, height = 6, dpi = 300)
+
+plot
+
+```
+
+
+
+#Proportions barplot
+
+```{r}
+
+tt<-prop.table(table(merged_seurat_harmony$celltype, merged_seurat_harmony$orig.ident), margin = 2)
+df<-melt(tt)
+colnames(df) <- c("CellType", "Sample", "Proportion")
+df$CellType <- factor(df$CellType, levels = rev(levels(merged_seurat_harmony$celltype)))
+df$Sample<-factor(df$Sample, levels = c("young5", "young4", "young3", "young2", "young1"))
+#pdf("/home/mainciburu/scRNA/figures_dec20/figure1/proportion_young.pdf", useDingbats = F,
+   # width = 14, height = 5)
+
+# Use the "Set3" palette and extend it by repeating colors or combining with another palette
+col.young.v3 <- c(brewer.pal(12, "Set3"), "#FF6F61", "#6B5B93")  # Adding two more colors
+
+p<-ggplot(df, aes(Proportion, Sample, fill = CellType)) + geom_bar(stat = "identity", width = 0.5) + 
+  scale_fill_manual(values = rev(col.young.v3)) + theme_minimal() +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(size = 20), axis.title = element_text(size = 22)) +
+  theme(text = element_text(face = "bold"))
+
+q <- ggplot(df, aes(Sample, Proportion, fill = CellType)) +
+    geom_bar(stat = "identity", position = "stack", width = 0.5) +
+    theme_minimal() +
+    labs(x = "Sample group", y = "Proportion", title = "Cell type proportions by group") +
+    scale_fill_brewer(palette = "Set3")
+q
+p
+#dev.off()
+```
+
+
+```{r}
+
+# Markers
+
+
+  hsc<-c("CRHBP", "HOPX", "KYT", "CD34")
+  lmpp<-c("PTPRC", "FLT3", "PROM1", "SATB1")  
+  cc<-c("CDC20", "TOP2A")
+  gmp<-c("CSF3R", "AC002454.1", "NPDC1", "SPARC")
+  granul<-c("ELANE", "AZU1", "CEBPA", "CEBPE", "CST7")
+  mono<-c("LYZ", "CSTA")
+  dc<-c("IRF8", "IRF7", "IL3RA", "CLEC4")
+  t<-c("JCHAIN", "IKZF1", "CYTH1")
+	nk<-c("TSC22D1", "CXXC5", "HOXA9", "HOXA10")
+  clp<-c("IL7R", "DNTT")
+  prob<-c("VPREB1", "EBF1", "CD79A", "CD79B")
+  mep<-c("NFE2", "HFS1", "TAL1")
+  mk<-c("PBX1", "MPL", "VWF", "FLI1", "ITGA22B", "GP1BA")
+  ery<-c("GATA1", "HBD", "HBB", "CA1", "AHSP",  "KLF1")
+  baso<-c("RUNX1", "HDC", "MS4A2", "MS4A3", "TPSAB1")
+  
+  N_markers<-c(hsc, lmpp, cc, gmp, granul, mono, dc, clp, prob, t, mep, mk, ery, baso)
+  N_markers<-markers[markers%in%rownames(merged_seurat_harmony)]
+
+```
+
+
+```{r }
+
+#g_umap <- DimPlot(merged_seurat_harmony, label = F) + ggtitle("Res:0.5, npcs : 50")
+
+features <- c("TPSAB1", "MS4A3", "MS4A2", "HDC", "RUNX1", "KLF1", "AHSP", "CA1", "HBB", "HBD", "GATA1",  
+                       "GP1BA", "FLII", "VWF", "PBX1", "TAL1", "NFE2", "HOXA10", "HOXA9", "CXXC5", "LTB", 
+                       "PRSS2", "JCHAIN", "IGHM", "CD79B", "CD79A", "EBF1", "VPREB1", "DNTT", "IL7R", "SPIB", 
+                       "IGKC", "IL3RA", "IRF7", "IRF8", "CSTA", "LYZ", "CST7", "CEBPA", "AZU1", "ELANE", 
+                       "MPO", "PRTN3", "CTSG", "CSF3R", "SATB1", "PROM1", "FLT3", "PTPRC", "CD34", "HOPX", "CRHBP")
+
+                       
+
+g_heatmap <- DotPlot(merged_seurat_harmony, features = features, group.by = "seurat_clusters", dot.scale = 8) + theme(axis.text.y = element_text(angle = 45, vjust = 1, hjust=1, size = 8), # Adjust angle and text size
+        axis.text.x = element_text(size = 10), # Smaller text for y-axis labels
+        axis.title.y = element_text(size = 10, face = "bold"), # Bold x-axis title
+        axis.title.x = element_text(size = 10, face = "bold"), # Bold y-axis title
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"), # Center and bold title
+        legend.position = "bottom") + 
+ scale_color_viridis_c(option = "plasma") + # Use a colorblind-friendly palette like viridis
+ ggtitle("DotPlot of Cluster Markers")+coord_flip()+theme_classic()
+
+g_heatmap
+```
+
+
+
+
+```{r}
+# Retrieve the current identities (cell types)
+cell_types <- Idents(merged_seurat_harmony)
+
+# Add these identities as a new column called "celltype" in the meta.data slot
+merged_seurat_harmony$celltype <- cell_types
+```
+
+
+
+# assign columnname to cell idents
+```{r}
+celltypes <- Idents(merged_seurat_harmony) %>% as.data.frame() %>% {names(.)[1] <- "celltype"; .}
+celltypes <- celltypes %>% rownames_to_column(var = "barcode")
+```
+
+
+
+#visualize percentage of cells in the cluster compared to all others
+
+```{r}
+
+pct_plot <- ggplot(markers) + 
+  aes(x = pct.1, y = pct.2) + 
+  geom_point()+
+  xlim(0,1)+
+  ylim(0,1)+
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed")+
+  facet_wrap(~ cluster)
+  theme_minimal()
+  
+```
+
+
+# remove cluster 14
+```{r}
+
+cluster_14_cells <- WhichCells(merged_seurat_harmony, idents = "14")
+
+merged_seurat_harmony <- subset(merged_seurat_harmony, cells = setdiff(Cells(merged_seurat_harmony), cluster_14_cells ))
+```
+
+
+
+
+
+```{r}
+h_umap <- DimPlot(merged_seurat_harmony, label = T) + ggtitle("Res:0.5, npcs : 50")
+
+features <- c("CSF3R","CD40LG","AVP","ELANE","LYZ","AL157895.1","SCT", "IL7R","LINC01013","PIMREG","CLC","AL118516.1","CCR9","CLEC1B","HBB")
+
+x <- markers %>% group_by(cluster) %>% top_n(n = 1, wt = avg_log2FC)
+fp1 <- FeaturePlot(merged_seurat_harmony, features = x$gene[1:4])
+fp2 <- FeaturePlot(merged_seurat_harmony, features = x$gene[5:8])
+fp3 <- FeaturePlot(merged_seurat_harmony, features = x$gene[9:12])
+fp4 <- FeaturePlot(merged_seurat_harmony, features = x$gene[13:15])
+
+
+ggsave(filename = "../eLife_/Plots/Top1_markergenes/fp1.png", plot = plot, width = 8, height = 6, dpi = 300)
+
+# Assuming you have a list of your plots stored in a variable
+plots <- list(fp1, fp2, fp3, fp4)  # Replace with your actual plot objects
+plot_names <- c("fp1.png", "fp2.png", "fp3.png", "fp4.png")
+
+# Loop through and save each plot with corresponding filename
+for (i in 1:4) {
+  ggsave(
+    filename = paste0("../eLife_/Plots/Top1_markergenes/", plot_names[i]),
+    plot = plots[[i]],
+    width = 8,
+    height = 6,
+    dpi = 300
+  )
+}
+
+
+FeaturePlot(merged_seurat_harmony, features = features, cols = c('grey', 'red'))
+
+h_heatmap <- DotPlot(merged_seurat_harmony, features = features) + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+h_res_1.0 <- h_umap + h_heatmap
+```
+
+
+
+```{r}
+top10 <- markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+top10
+```
+
+
+
+#####SCENIC PACKAGES
+
+```{r SCENIC}
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::version()
+# If your bioconductor version is previous to 4.0, see the section bellow
+
+## Required
+BiocManager::install(c("AUCell", "RcisTarget"))
+BiocManager::install(c("GENIE3")) # Optional. Can be replaced by GRNBoost
+
+## Optional (but highly recommended):
+# To score the network on cells (i.e. run AUCell):
+BiocManager::install(c("zoo", "mixtools", "rbokeh"))
+# For various visualizations and perform t-SNEs:
+BiocManager::install(c("DT", "NMF", "ComplexHeatmap", "R2HTML", "Rtsne"))
+# To support paralell execution (not available in Windows):
+BiocManager::install(c("doMC", "doRNG"))
+# To export/visualize in http://scope.aertslab.org
+if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
+devtools::install_github("aertslab/SCopeLoomR", build_vignettes = TRUE)
+
+
+```
+
+# Install SCENIC
+```{r}
+if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
+devtools::install_github("aertslab/SCENIC") 
+packageVersion("SCENIC")
+```
+
+
+
+```{r}
+dbFiles <- c("https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc9nr/gene_based/hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.genes_vs_motifs.rankings.feather", "https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc9nr/gene_based/hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.genes_vs_motifs.rankings.feather")
+
+
+singleCellMatrix <- Seurat::Read10X(data.dir = "../data/pbmc3k/filtered_gene_bc_matrices/hg19/")
+
+
+```
+
+####################################################################################### 
+
+```{r}
+# 3. Plot top 10 variable features
+top10 <- head(VariableFeatures(merged_seurat), 10)
+vp_plot <- LabelPoints(plot = VariableFeaturePlot(merged_seurat), points = top10, repel = TRUE)
+vp_plot <- vp_plot + ggtitle("Top 10 Variable Features") + theme_classic()
+ggsave(filename = "../eLife_/Plots/variableFeatures/top10_variable_features.png", plot = vp_plot, width = 5, height = 5)
+```
+
+```{r}
+# 4. Scale the data
+all_genes <- rownames(merged_seurat)
+merged_seurat <- ScaleData(merged_seurat, features = all_genes)
+
+# 5. Run PCA
+merged_seurat <- RunPCA(merged_seurat, features = VariableFeatures(object = merged_seurat), npcs = 50)
+
+# 6. Visualize PCA
+pca_plot <- DimPlot(merged_seurat, reduction = "pca") + theme_classic()
+ggsave(filename = "../eLife_/Plots/Dimplot/pca_plot.png", plot = pca_plot, width = 5, height = 5)
+```
+
+```{r Clustering, Find markers, cluster identification}
+
+rm(list = ls())
+library(future)
+library(future.apply)
+library(Seurat)
+library(patchwork)
+library(tidyverse)
+library(scCustomize)
+library(Matrix)
+
+# Define the main workflow to process each sample
+
+# 7.Clustering
+cluster_cells <- function(seurat_obj, project_name, pca_dim){
+  
+  
+  
+# Loop through each sample and apply FindNeighbors with different PCA dimensions
+    
+    seurat_obj <- FindNeighbors(seurat_obj, dims = pca_dim)
+  
+
+# understanding resolutions
+    for (res in seq(0.1, 1.0, by = 0.2)) {
+    seurat_obj <- FindClusters(seurat_obj, resolution = res)
+  }
+  
+  #seurat_obj <- FindClusters(seurat_obj, resolution = c(0.3, 0.5, 0.7, 1))
+#p2<- DimPlot_scCustom(h5_seuratObj, reduction = "umap", label = TRUE, group.by = "features", label.size = 3)
+
+# Look at cluster IDs of the first 5 cells
+  head(Idents(seurat_obj), 5)
+  
+#Run non-linear dimensional reduction (UMAP/tSNE)  
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:10)
+
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# individual clusters
+  umap <- DimPlot(seurat_obj, group.by = "RNA_snn_res.0.3", reduction = "umap", label = TRUE)  
+  ggsave(filename = paste0("../eLife_/Plots/UMAP/umap_", project_name, ".png"), plot = umap, width = 10, height = 5)
+  print(umap)
+  return(seurat_obj)
+}
+
+# Find markers
+cluster_sample <- function(seurat_obj, project_name) {
+  
+  #seurat_markers <- FindAllMarkers(seurat_object,
+                 #logfc.threshold = 0.25,
+                 #min.pct = 0.1,
+                 #only.pos = 2, # return only positive markers
+                 #test.use = 'DESeq2',
+                 #slot = 'counts')
+  # find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+  seurat_markers <- FindAllMarkers(seurat_obj, only.pos = TRUE)
+  seurat_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1)
+  
+  head(seurat_markers, n = 5)
+  
+  return(seurat_markers)
+
+# FindAllMarkers :- if data is from only one condition
+
+  
+  # Save Seurat object to RDS
+ # saveRDS(seurat_obj, file = paste0("../rds/seu_", project_name, ".rds"))
+  
+ # return(seurat_obj)
+}
+
+# Define the list of file paths
+file_paths <- list(
+  "../rds/seu_Young-1.rds",
+  "../rds/seu_Young-2.rds",
+  "../rds/seu_Young-3.rds",
+  "../rds/seu_Young-4.rds",
+  "../rds/seu_Young-5.rds"
+)
+
+project_names <- c("Young-1", "Young-2", "Young-3", "Young-4", "Young-5")
+
+# Load all Seurat objects into a list
+seurat_objects <- lapply(file_paths, readRDS) # seurat_objects[[1]] will be the first object 
+pca_dims <- list(c(1:10), c(1:12), c(1:12), c(1:9), c(1:10))
+
+# main workflow
+seurat_markers <- future_lapply(1:length(file_paths), function(i) {
+  
+  tryCatch({
+    
+    seurat_obj <- seurat_objects[[i]]# access each seurat obj
+    
+     #seurat_objects <- readRDS(file_paths[[i]])
+    # Then, apply the clustering function to the loaded Seurat object
+     # 6.clustering to loaded seurat object
+     seurat_obj <- cluster_cells(seurat_obj, project_names[i], pca_dims[i])
+     seurat_markers <- cluster_sample(seurat_obj, project_names[i])
+    
+  }, error = function(e) {
+       return(paste("Error:", e$message))
+  })
+}, future.seed = TRUE)
+
+
+
+```
